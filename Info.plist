@@ -22,5 +22,7 @@
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>Lilt reads the current song and position from Music so it can light the lyrics in time.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Lilt analyzes music audio to animate the ambient border. Captured content is not saved.</string>
 </dict>
 </plist>

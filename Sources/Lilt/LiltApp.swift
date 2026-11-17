@@ -1,7 +1,7 @@
+
 import Combine
 import CoreAudio
 import IOKit.pwr_mgt
-import SkyLightWindow
 import SwiftUI
 
 @main
@@ -9,6 +9,19 @@ struct LiltApp: App {
     @StateObject private var model = AppModel()
 
     init() {
+        if CommandLine.arguments.contains("--combined-preview-selftest") {
+            do { try MainActor.assumeIsolated { try runCombinedOverlayWindowTest() } }
+            catch { fputs("Combined preview test failed: \(error)\n", stderr); exit(1) }
+            exit(0)
+        }
+        if CommandLine.arguments.contains("--skylight-probe") {
+            exit(MainActor.assumeIsolated { ExperimentalLockScreenBridge.probe() } ? 0 : 1)
+        }
+        if let flag = CommandLine.arguments.firstIndex(of: "--glow-render") {
+            do { try MainActor.assumeIsolated { try renderGlowSequence(arguments: Array(CommandLine.arguments.dropFirst(flag + 1))) } }
+            catch { fputs("Glow render failed: \(error)\n", stderr); exit(1) }
+            exit(0)
+        }
         if CommandLine.arguments.contains("--selftest") {
             runSelfTest()
             exit(0)
@@ -36,15 +49,21 @@ struct LiltApp: App {
 final class AppModel: ObservableObject {
     let player: PlayerMonitor
     private let store: LyricsStore
-    private let overlay = OverlayWindow()
     private let lyricsWindow = LyricsWindow()
+    private let glowWindow = GlowWindow(disabled: OverlayLaunchOptions.current.disabled)
     private let awake = DisplayAwake()
     private var subscriptions = Set<AnyCancellable>()
 
     @Published var lyrics: Lyrics?
-    @Published var palette: AlbumPalette?  // colours pulled from the album art, for Auto Sync
+    @Published var palette: AlbumPalette?
     @Published var status = "Waiting for music"
     @Published var isLocked = false
+    @Published private(set) var combinedPreviewActive = false
+    @Published var keepPreviewAwake = false { didSet { updateDisplayAwake() } }
+    let overlaysDisabled = OverlayLaunchOptions.current.disabled
+    private var previewVisible = false
+    private var previewTask: Task<Void, Never>?
+
     /// Extra delay for the current audio output; Bluetooth headphones play ~0.2 s late.
     @Published var outputDelay = 0.0
 
@@ -57,170 +76,242 @@ final class AppModel: ObservableObject {
         player.$track.removeDuplicates().receive(on: RunLoop.main)
             .sink { [weak self] track in self?.trackChanged(track) }
             .store(in: &subscriptions)
+
         player.$isPlaying.removeDuplicates().receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.refresh() }
             .store(in: &subscriptions)
 
         let center = DistributedNotificationCenter.default()
+
         center.addObserver(forName: .init("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.setLocked(true) }
         }
+
         center.addObserver(forName: .init("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.setLocked(false) }
         }
 
+        glowWindow.onPresentationChanged = { [weak self] visible in
+            self?.previewVisible = visible
+            self?.updateDisplayAwake()
+        }
+        glowWindow.startMonitoring()
         player.start()
+        if CommandLine.arguments.contains("--combined-preview") {
+            Task { @MainActor [weak self] in self?.startCombinedPreview() }
+        }
     }
 
     private func setLocked(_ locked: Bool) {
+        LifecycleLog.note("app: setLocked(\(locked)) lyricsLoaded=\(lyrics != nil) playing=\(player.isPlaying) "
+            + "trackKnown=\(player.track != nil)")
         isLocked = locked
+        if locked { stopCombinedPreview() }
         refresh()
     }
 
     private func trackChanged(_ track: Track?) {
         lyrics = nil
         palette = nil
-        outputDelay = outputIsBluetooth() ? 0.2 : 0  // headphones can change between songs
+        outputDelay = outputIsBluetooth() ? 0.2 : 0
         refresh()
+
         guard let track else {
             status = "Waiting for music"
             return
         }
+
         status = "Looking up lyrics…"
+
         Task {
-            // Retry while Cider cannot reach Apple Music (it can lose the network after a
-            // Wi-Fi change); stop as soon as lyrics arrive or Apple says the song has none.
+            // Retry while Cider cannot reach Apple Music.
             for _ in 0..<40 {
                 let colors = await store.artworkColors(for: track)
                 let found = await store.lyrics(for: track)
-                guard player.track == track else { return }  // the song changed while we waited
-                if palette == nil { palette = AlbumPalette(hexes: colors) }
+
+                guard player.track == track else { return }
+
+                if palette == nil {
+                    palette = AlbumPalette(hexes: colors)
+                }
+
                 if let found {
-                    WordIcons.shared.warm(found.lines)  // icons ready before they are needed
+                    WordIcons.shared.warm(found.lines)
                     lyrics = found
-                    status = found.wordTimed ? "Word-timed lyrics" : "Line-timed lyrics, word times estimated"
+                    status = found.wordTimed
+                        ? "Word-timed lyrics"
+                        : "Line-timed lyrics, word times estimated"
                     refresh()
                     return
                 }
-                // Only a Cider song that Cider cannot look up is worth retrying (Cider sometimes
-                // loses the network after a Wi-Fi change); otherwise neither source has it.
+
                 let ciderOnline = await store.appleMusicReachable()
+
                 if track.source != .cider || ciderOnline {
                     status = "No lyrics for this song"
                     return
                 }
+
                 guard player.track == track else { return }
+
                 status = "Cider can't reach Apple Music. Retrying… (restart Cider or check the token)"
+
                 try? await Task.sleep(for: .seconds(15))
             }
         }
     }
 
     func openLyricsWindow() {
-        lyricsWindow.open(AnyView(LyricsView(model: self, player: player)))
+        lyricsWindow.open(
+            AnyView(LyricsView(model: self, player: player))
+        )
     }
 
-    /// Shows the lock screen overlay only while lyrics exist, music plays, and the Mac is locked.
+    func startCombinedPreview() {
+        guard !overlaysDisabled, !isLocked else { return }
+        combinedPreviewActive = true
+        glowWindow.setPreviewContent(AnyView(ConstellationView(model: self, player: player, isOverlayPreview: true)))
+        previewTask?.cancel()
+        previewTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(60))
+            guard !Task.isCancelled else { return }
+            self?.stopCombinedPreview()
+        }
+        updateDisplayAwake()
+    }
+
+    func stopCombinedPreview() {
+        previewTask?.cancel()
+        previewTask = nil
+        combinedPreviewActive = false
+        glowWindow.setPreviewContent(nil)
+        updateDisplayAwake()
+    }
+
+    /// Same condition as the original lock-screen overlay: lyrics exist and music is playing.
     private func refresh() {
-        let show = lyrics != nil && player.isPlaying && isLocked
-        if show {
-            overlay.show(AnyView(LyricsView(model: self, player: player)))
-        } else {
-            overlay.hide()
-        }
-        awake.set(show)
+        let showLyrics = lyrics != nil && player.isPlaying
+        glowWindow.setMusicPlaying(player.isPlaying)
+        // Lock screen: exactly upstream's overlay content (LyricsView, full screen, own black stage).
+        // Desktop: the same Constellation on a transparent, click-through stage over your apps.
+        // Which of them actually appears is decided by the Display Location settings.
+        glowWindow.setLyricsContent(
+            lock: showLyrics ? AnyView(LyricsView(model: self, player: player)) : nil,
+            desktop: showLyrics ? AnyView(ConstellationView(model: self, player: player, transparentBackground: true)) : nil)
+        updateDisplayAwake()
+    }
+
+    private func updateDisplayAwake() {
+        let preview = OverlayPresentationPolicy.holdDisplayAwake(
+            disabled: overlaysDisabled, previewRequested: combinedPreviewActive,
+            windowVisible: previewVisible, optedIn: keepPreviewAwake, locked: isLocked)
+        // Like the original Constellation overlay: keep the lock screen lit while it shows music.
+        let lock = OverlayPresentationPolicy.holdDisplayAwakeOnLockScreen(
+            locked: isLocked, presented: glowWindow.isLockScreenPresented, playing: player.isPlaying)
+        let hold = preview || lock
+        if hold != awake.held { LifecycleLog.note("power: display-awake assertion \(hold ? "held" : "released") (lock=\(lock) preview=\(preview))") }
+        awake.set(hold)
     }
 }
 
-/// A full-screen, click-through window placed above the lock screen.
-@MainActor
-final class OverlayWindow {
-    private var panel: NSPanel?
-
-    func show(_ content: AnyView) {
-        guard let screen = NSScreen.main else { return }
-        if panel == nil {
-            // A non-activating panel never steals keyboard focus from the app you are using.
-            let newPanel = NSPanel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel],
-                                   backing: .buffered, defer: false)
-            newPanel.isOpaque = false
-            newPanel.backgroundColor = .clear
-            newPanel.hasShadow = false
-            newPanel.ignoresMouseEvents = true
-            newPanel.canBecomeVisibleWithoutLogin = true
-            newPanel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
-            newPanel.level = .screenSaver
-            newPanel.contentView = NSHostingView(rootView: content)
-            panel = newPanel
-        }
-        guard let panel, !panel.isVisible else { return }
-        panel.setFrame(screen.frame, display: true)
-        panel.orderFrontRegardless()
-        // Needs a window number, so only after the window is on screen.
-        SkyLightOperator.shared.delegateWindow(panel)
-    }
-
-    func hide() {
-        panel?.orderOut(nil)
-    }
-}
-
-/// An ordinary resizable window for watching the lyrics while the Mac is unlocked.
+/// A normal resizable window for lyrics while the Mac is unlocked.
 @MainActor
 final class LyricsWindow {
     private var window: NSWindow?
 
     func open(_ content: AnyView) {
         if window == nil {
-            let newWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 600),
-                                     styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-                                     backing: .buffered, defer: false)
+            let newWindow = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 960, height: 600),
+                styleMask: [
+                    .titled,
+                    .closable,
+                    .miniaturizable,
+                    .resizable,
+                    .fullSizeContentView
+                ],
+                backing: .buffered,
+                defer: false
+            )
+
             newWindow.title = "Lilt"
             newWindow.titlebarAppearsTransparent = true
             newWindow.titleVisibility = .hidden
             newWindow.backgroundColor = .black
-            newWindow.isReleasedWhenClosed = false  // so the menu can open it again after closing
+            newWindow.isReleasedWhenClosed = false
             newWindow.contentMinSize = NSSize(width: 480, height: 300)
             newWindow.contentView = NSHostingView(rootView: content)
             newWindow.center()
-            newWindow.setFrameAutosaveName("LiltLyricsWindow")  // remembers size and position
+            newWindow.setFrameAutosaveName("LiltLyricsWindow")
+
             window = newWindow
         }
+
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
     }
 }
 
-/// True when the default output device is Bluetooth (AirPods and friends).
+/// True when the default output device is Bluetooth.
 func outputIsBluetooth() -> Bool {
-    var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-                                             mScope: kAudioObjectPropertyScopeGlobal,
-                                             mElement: kAudioObjectPropertyElementMain)
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+
     var device = AudioDeviceID(0)
     var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device) == noErr
-    else { return false }
+
+    guard AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject),
+        &address,
+        0,
+        nil,
+        &size,
+        &device
+    ) == noErr else {
+        return false
+    }
 
     address.mSelector = kAudioDevicePropertyTransportType
+
     var transport = UInt32(0)
     size = UInt32(MemoryLayout<UInt32>.size)
-    guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &transport) == noErr else { return false }
-    return transport == kAudioDeviceTransportTypeBluetooth || transport == kAudioDeviceTransportTypeBluetoothLE
+
+    guard AudioObjectGetPropertyData(
+        device,
+        &address,
+        0,
+        nil,
+        &size,
+        &transport
+    ) == noErr else {
+        return false
+    }
+
+    return transport == kAudioDeviceTransportTypeBluetooth
+        || transport == kAudioDeviceTransportTypeBluetoothLE
 }
 
-/// Keeps the display from sleeping while lyrics are on screen.
+/// Optional user-idle display-sleep assertion only. Cannot override lid closure or explicit sleep.
 final class DisplayAwake {
     private var assertion: IOPMAssertionID = 0
-    private var held = false
+    private(set) var held = false
+
+    deinit { if held { IOPMAssertionRelease(assertion) } }
 
     func set(_ on: Bool) {
         if on && !held {
             let result = IOPMAssertionCreateWithName(
                 kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
                 IOPMAssertionLevel(kIOPMAssertionLevelOn),
-                "Lilt is showing lyrics" as CFString,
-                &assertion)
+                "Lilt is showing lyrics and lighting" as CFString,
+                &assertion
+            )
+
             held = result == kIOReturnSuccess
+
         } else if !on && held {
             IOPMAssertionRelease(assertion)
             held = false
@@ -231,7 +322,8 @@ final class DisplayAwake {
 struct MenuView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var player: PlayerMonitor
-    // ponytail: token sits in UserDefaults in plain text, move to Keychain if that ever matters.
+
+    // Cider token stored in UserDefaults.
     @AppStorage("ciderToken") private var token = ""
     @AppStorage("textColor") private var textHex = Theme.defaultText
     @AppStorage("highlightColor") private var highlightHex = Theme.defaultHighlight
@@ -242,59 +334,135 @@ struct MenuView: View {
     @AppStorage("lyricStyle") private var styleChoice = LyricStyle.constellation.rawValue
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if let track = player.track {
-                Text(track.title).font(.headline)
-                Text("\(track.artist) · \(track.source.rawValue)").foregroundStyle(.secondary)
-            } else {
-                Text("Nothing playing").font(.headline)
-            }
-            Text(model.status).font(.caption).foregroundStyle(.secondary)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                if let track = player.track {
+                    Text(track.title)
+                        .font(.headline)
 
-            Divider()
-            Picker("Style", selection: $styleChoice) {
-                ForEach(LyricStyle.allCases) { style in
-                    Text(style.rawValue).tag(style.rawValue)
+                    Text("\(track.artist) · \(track.source.rawValue)")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Nothing playing")
+                        .font(.headline)
+                }
+
+                Text(model.status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Divider()
+
+                Picker("Style", selection: $styleChoice) {
+                    ForEach(LyricStyle.allCases) { style in
+                        Text(style.rawValue)
+                            .tag(style.rawValue)
+                    }
+                }
+
+                Divider()
+
+                Text("Color")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Toggle("Auto Sync from album", isOn: $autoSync)
+
+                ColorPicker(
+                    "Lyric text",
+                    selection: hexBinding($textHex)
+                )
+                .disabled(autoSync)
+
+                ColorPicker(
+                    "Highlight",
+                    selection: hexBinding($highlightHex)
+                )
+                .disabled(autoSync)
+
+                ColorPicker(
+                    "Secondary text",
+                    selection: hexBinding($secondaryHex)
+                )
+                .disabled(autoSync)
+
+                Button("Reset colors") {
+                    textHex = Theme.defaultText
+                    highlightHex = Theme.defaultHighlight
+                    secondaryHex = Theme.defaultSecondary
+                }
+
+                Picker("Font", selection: $fontChoice) {
+                    ForEach(LyricFont.allCases) { choice in
+                        Text(choice.rawValue)
+                            .tag(choice.rawValue)
+                    }
+                }
+
+                Divider()
+
+                Button("Open lyrics window") {
+                    model.openLyricsWindow()
+                }
+
+                Button(model.combinedPreviewActive ? "Stop combined preview" : "Preview Constellation + lighting") {
+                    if model.combinedPreviewActive { model.stopCombinedPreview() }
+                    else { model.startCombinedPreview() }
+                }
+                .disabled(model.overlaysDisabled)
+
+                if model.combinedPreviewActive {
+                    Text("Unlocked preview · stops after 60 seconds. Uses sample lyrics when playback or timed lyrics are unavailable.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                Toggle("Keep display awake during preview", isOn: $model.keepPreviewAwake)
+                    .disabled(model.overlaysDisabled)
+                if model.overlaysDisabled {
+                    Text("Safe mode: all overlays disabled.").font(.caption)
+                }
+
+                DisplayLocationSettingsView()
+
+                Divider()
+
+                AmbientLightingSettingsView()
+
+                HStack {
+                    Text("Lyrics delay")
+
+                    Slider(
+                        value: $delay,
+                        in: -0.5...1.0,
+                        step: 0.05
+                    )
+
+                    Text(String(format: "%+.2f s", delay))
+                        .monospacedDigit()
+                        .frame(width: 52, alignment: .trailing)
+                }
+
+                if model.outputDelay > 0 {
+                    Text("Bluetooth output: +0.20 s added automatically")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                Divider()
+
+                SecureField("Cider app token", text: $token)
+
+                Text("Optional. For Apple's word-timed lyrics: Cider → Settings → Connectivity")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                Divider()
+
+                Button("Quit Lilt") {
+                    NSApp.terminate(nil)
                 }
             }
-
-            Divider()
-            Text("Color").font(.caption).foregroundStyle(.secondary)
-            Toggle("Auto Sync from album", isOn: $autoSync)
-            // With Auto Sync on, the album art decides; the pickers come back when it is off.
-            ColorPicker("Lyric text", selection: hexBinding($textHex)).disabled(autoSync)
-            ColorPicker("Highlight", selection: hexBinding($highlightHex)).disabled(autoSync)
-            ColorPicker("Secondary text", selection: hexBinding($secondaryHex)).disabled(autoSync)
-            Button("Reset colors") {
-                textHex = Theme.defaultText
-                highlightHex = Theme.defaultHighlight
-                secondaryHex = Theme.defaultSecondary
-            }
-
-            Picker("Font", selection: $fontChoice) {
-                ForEach(LyricFont.allCases) { choice in
-                    Text(choice.rawValue).tag(choice.rawValue)
-                }
-            }
-
-            Divider()
-            Button("Open lyrics window") { model.openLyricsWindow() }
-            HStack {
-                Text("Lyrics delay")
-                Slider(value: $delay, in: -0.5...1.0, step: 0.05)
-                Text(String(format: "%+.2f s", delay)).monospacedDigit().frame(width: 52, alignment: .trailing)
-            }
-            if model.outputDelay > 0 {
-                Text("Bluetooth output: +0.20 s added automatically").font(.caption2).foregroundStyle(.secondary)
-            }
-            Divider()
-            SecureField("Cider app token", text: $token)
-            Text("Optional. For Apple's word-timed lyrics: Cider → Settings → Connectivity").font(.caption2).foregroundStyle(.secondary)
-
-            Divider()
-            Button("Quit Lilt") { NSApp.terminate(nil) }
+            .padding(14)
         }
-        .padding(14)
-        .frame(width: 270)
+        .frame(width: 300, height: min(780, (NSScreen.main?.visibleFrame.height ?? 860) - 80))
     }
 }

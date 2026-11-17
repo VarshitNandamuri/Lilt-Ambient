@@ -1,4 +1,5 @@
 import SwiftUI
+import Metal
 
 /// `Lilt --selftest`: checks the lyric parsing, the part most likely to break quietly.
 func runSelfTest() {
@@ -37,7 +38,76 @@ func runSelfTest() {
     precondition(lrc.wordTimed && lrc.lines[2].words[1].start == 6.5, "enhanced tags give real word times")
     precondition(parseTime("00:00:10.050") == 10.05 && parseTime("12.3s") == 12.3, "time formats")
 
+    runOverlayPolicySelfTest()
+    MainActor.assumeIsolated { runAmbientLightingSelfTest() }
     print("selftest ok")
+}
+
+@MainActor
+private func runAmbientLightingSelfTest() {
+    SystemAudioAnalyzer.validateDSP()
+    func table(_ model: GlowModel) -> [GlowSample] {
+        var samples = [GlowSample](repeating: GlowSample(color: .zero, shape: .zero), count: 512)
+        samples.withUnsafeMutableBufferPointer { model.fill($0.baseAddress!, count: $0.count) }
+        return samples
+    }
+    // Identical elapsed time must produce the same flow at different refresh rates.
+    let slow = GlowModel(), fast = GlowModel()
+    for (model, fps) in [(slow, 30), (fast, 120)] {
+        model.settings.mode = .idle
+        model.useDefaultColors()
+        for frame in 0...fps*3 { model.step(now: 1 + Double(frame) / Double(fps)) }
+    }
+    for (a, b) in zip(table(slow), table(fast)) {
+        precondition(abs(a.color.w - b.color.w) < 0.005 && abs(a.shape.y - b.shape.y) < 0.05,
+                     "Perimeter flow must be independent of frame rate")
+    }
+    let model = GlowModel()
+    model.settings.mode = .idle
+    for frame in 0..<120 { model.step(now: 1 + Double(frame) / 60) }
+    precondition(model.amplitude > 0.4, "Idle must show lighting without a player or audio permission")
+
+    model.settings.mode = .musicSync
+    model.audioSource = {
+        AudioSnapshot(bass: 0.9, mid: 0.6, treble: 0.3, audible: true, beatCount: 1, timestamp: 3)
+    }
+    model.step(now: 3)
+    precondition(model.bass > 0 && model.amplitude > 0, "Music audio must drive the border")
+    // A stopped or interrupted stream must fade out, even if its last sample was loud.
+    for frame in 0..<600 { model.step(now: 4 + Double(frame) / 60) }
+    precondition(model.amplitude < 0.003, "Stale audio must fade to transparent")
+
+    let field = GlowField.build(size: CGSize(width: 160, height: 100), notch: nil)
+    precondition(field.data[0] < 15, "The display edge must be in the glow field")
+    let center = ((field.height / 2) * field.width + field.width / 2) * 4
+    precondition(field.data[center] > 40, "The center must stay away from the lit edge")
+    if let device = MTLCreateSystemDefaultDevice() {
+        do {
+            let renderer = try GlowRenderer(model: model, device: device)
+            renderer.setField(field)
+            model.settings.mode = .idle
+            for frame in 0..<180 { model.step(now: 15 + Double(frame) / 60) }
+            let data = try renderer.renderFrame(width: 160, height: 100, bounds: CGSize(width: 160, height: 100))
+            data.withUnsafeBytes { raw in
+                let pixels = raw.bindMemory(to: UInt8.self)
+                for x in 50..<110 {
+                    for y in 2..<20 {
+                        let edgeward = Int(pixels[(y * 160 + x) * 4 + 3])
+                        let inward = Int(pixels[((y + 1) * 160 + x) * 4 + 3])
+                        precondition(inward <= edgeward + 3, "Light must stay filled to the edge, without a detached crest")
+                    }
+                }
+            }
+            let notch = NotchMetrics(left: 50, right: 110, height: 16)
+            renderer.setField(GlowField.build(size: CGSize(width: 160, height: 100), notch: notch))
+            let notched = try renderer.renderFrame(width: 160, height: 100, bounds: CGSize(width: 160, height: 100))
+            precondition(notched[(4 * 160 + 80) * 4 + 3] == 0, "The notch opening must remain transparent")
+        } catch {
+            preconditionFailure("Ambient Metal pipeline failed: \(error)")
+        }
+    } else {
+        print("ambient Metal pipeline check skipped: no GPU available")
+    }
 }
 
 /// `Lilt --preview out.png [seconds] [width] [height]`: draws one frame of the constellation

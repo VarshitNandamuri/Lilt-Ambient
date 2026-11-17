@@ -11,6 +11,8 @@ import SwiftUI
 struct ConstellationView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var player: PlayerMonitor
+    var isOverlayPreview = false
+    var transparentBackground = false
     @AppStorage("textColor") private var textHex = Theme.defaultText
     @AppStorage("highlightColor") private var highlightHex = Theme.defaultHighlight
     @AppStorage("secondaryColor") private var secondaryHex = Theme.defaultSecondary
@@ -25,7 +27,7 @@ struct ConstellationView: View {
                 makePainter(at: timeline.date).draw(context, size: size)
             }
         }
-        .background(Color.black)  // its own dark stage, not a see-through layer over apps
+        .background(isOverlayPreview || transparentBackground ? Color.clear : Color.black)
         .ignoresSafeArea()
     }
 
@@ -39,10 +41,12 @@ struct ConstellationView: View {
             highlight = palette.highlight
             secondary = palette.secondary
         }
+        let useSample = isOverlayPreview && (model.lyrics == nil || !player.isPlaying)
         return ConstellationPainter(
-            lines: model.lyrics?.lines ?? [],
+            lines: useSample ? ConstellationPreviewSample.lines : (model.lyrics?.lines ?? []),
             // Positive delay holds the lyrics back to match what you actually hear.
-            songTime: player.position(at: date) - delay - model.outputDelay,
+            songTime: useSample ? date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 12)
+                : player.position(at: date) - delay - model.outputDelay,
             clock: date.timeIntervalSinceReferenceDate,
             textColor: text,
             highlight: highlight,
@@ -51,6 +55,14 @@ struct ConstellationView: View {
             layouts: layouts
         )
     }
+}
+
+enum ConstellationPreviewSample {
+    static let lines: [LyricLine] = ["we drew the stars ourselves out of nothing", "and named them after everyone we never got to meet"]
+        .enumerated().map { index, text in
+            let start = Double(index) * 6
+            return LyricLine(start: start, end: start + 6, words: estimateWords(text, start: start, end: start + 6))
+        }
 }
 
 enum LabelSide: CaseIterable {
